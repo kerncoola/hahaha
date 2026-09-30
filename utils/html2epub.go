@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -44,7 +45,27 @@ type HtmlToEpub struct {
 	DefaultCover []byte
 	book         *epub.Epub
 	imgIdx       int
+	sectionCSS   string
+	tempCSSPath  string
 }
+
+const kindleSafeCSS = `
+body, div, p, li, span, a, blockquote, h1, h2, h3, h4, h5, h6 {
+	font-family: STHeiti, STYuan, "Amazon Ember", Helvetica, Arial, sans-serif !important;
+}
+pre, code, kbd, samp {
+	font-family: monospace !important;
+}
+p {
+	margin: 1.5em 0;
+}
+`
+
+var (
+	cssFontFaceBlockRE = regexp.MustCompile(`(?is)@font-face\s*\{.*?\}`)
+	cssFontFamilyRE    = regexp.MustCompile(`(?i)font-family\s*:[^;}{]+;?`)
+	inlineFontFamilyRE = regexp.MustCompile(`(?i)font-family\s*:[^;]+;?`)
+)
 
 func (h *HtmlToEpub) Run() (err error) {
 	if len(h.HTML) == 0 {
@@ -54,6 +75,8 @@ func (h *HtmlToEpub) Run() (err error) {
 	return h.run()
 }
 func (h *HtmlToEpub) run() (err error) {
+	defer h.cleanupTempFiles()
+
 	err = h.genBook()
 	if err != nil {
 		return
@@ -75,11 +98,22 @@ func (h *HtmlToEpub) run() (err error) {
 	return
 }
 
+func (h *HtmlToEpub) cleanupTempFiles() {
+	if h.tempCSSPath == "" {
+		return
+	}
+	_ = os.Remove(h.tempCSSPath)
+	h.tempCSSPath = ""
+}
+
 func (h *HtmlToEpub) genBook() error {
 	h.book = epub.NewEpub(h.Title)
 	h.book.SetAuthor(h.Author)
 	h.book.SetDescription(h.Description)
-	return h.setCover()
+	if err := h.setCover(); err != nil {
+		return err
+	}
+	return h.setKindleSafeCSS()
 }
 
 func (h *HtmlToEpub) setCover() (err error) {
@@ -116,6 +150,7 @@ func (h *HtmlToEpub) add(html HtmlContent) (err error) {
 	if err != nil {
 		return
 	}
+	h.sanitizeFontStyles(doc)
 
 	images := h.saveImages(doc)
 	doc.Find("img").
@@ -142,12 +177,12 @@ func (h *HtmlToEpub) add(html HtmlContent) (err error) {
 	}
 	if html.ChapterID != "cover.xhtml" {
 		if len(html.Toc) > 0 {
-			_, err = h.book.AddSection(content, html.Toc[0].Text, html.ChapterID, "")
+			_, err = h.book.AddSection(content, html.Toc[0].Text, html.ChapterID, h.sectionCSS)
 			if err != nil {
 				return
 			}
 		} else {
-			_, err = h.book.AddSection(content, "", html.ChapterID, "")
+			_, err = h.book.AddSection(content, "", html.ChapterID, h.sectionCSS)
 			if err != nil {
 				return
 			}
@@ -170,6 +205,57 @@ func (h *HtmlToEpub) add(html HtmlContent) (err error) {
 	// 	}
 	// }
 	return
+}
+
+func (h *HtmlToEpub) setKindleSafeCSS() error {
+	temp, err := os.CreateTemp("", "dedao-kindle-safe-*.css")
+	if err != nil {
+		return fmt.Errorf("can't create css tempfile: %s", err)
+	}
+
+	if _, err = temp.WriteString(kindleSafeCSS); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("can't write css tempfile: %s", err)
+	}
+	if err = temp.Close(); err != nil {
+		return fmt.Errorf("can't close css tempfile: %s", err)
+	}
+
+	h.tempCSSPath = temp.Name()
+	h.sectionCSS, err = h.book.AddCSS(temp.Name(), "epub-kindle-safe.css")
+	if err != nil {
+		return fmt.Errorf("can't add kindle safe css: %s", err)
+	}
+	return nil
+}
+
+func (h *HtmlToEpub) sanitizeFontStyles(doc *goquery.Document) {
+	doc.Find("style").Each(func(i int, style *goquery.Selection) {
+		text := style.Text()
+		text = cssFontFaceBlockRE.ReplaceAllString(text, "")
+		text = cssFontFamilyRE.ReplaceAllString(text, "")
+		text = strings.TrimSpace(text)
+		if text == "" {
+			style.Remove()
+			return
+		}
+		style.SetText(text)
+	})
+
+	doc.Find("[style]").Each(func(i int, s *goquery.Selection) {
+		inline, ok := s.Attr("style")
+		if !ok || inline == "" {
+			return
+		}
+		inline = inlineFontFamilyRE.ReplaceAllString(inline, "")
+		inline = strings.TrimSpace(inline)
+		inline = strings.Trim(inline, ";")
+		if inline == "" {
+			s.RemoveAttr("style")
+			return
+		}
+		s.SetAttr("style", inline)
+	})
 }
 
 func (h *HtmlToEpub) saveImages(doc *goquery.Document) map[string]string {

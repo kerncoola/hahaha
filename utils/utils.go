@@ -128,18 +128,6 @@ func M3u8URLs(uri string) (urls []string, err error) {
 	return
 }
 
-// CurrentDir CurrentDir
-func CurrentDir(joinPath ...string) (string, error) {
-	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	if err != nil {
-		return "", err
-	}
-	p := strings.Replace(dir, "\\", "/", -1)
-	whole := filepath.Join(joinPath...)
-	whole = filepath.Join(p, whole)
-	return whole, nil
-}
-
 // ResolveURL parse url
 func ResolveURL(u *url.URL, p string) string {
 	if strings.HasPrefix(p, "https://") || strings.HasPrefix(p, "http://") {
@@ -153,6 +141,48 @@ func ResolveURL(u *url.URL, p string) string {
 		baseURL = tU[0:strings.LastIndex(tU, "/")]
 	}
 	return baseURL + path.Join("/", p)
+}
+
+func NormalizeMarkdownLink(rawLink string) string {
+	rawLink = strings.TrimSpace(rawLink)
+	if rawLink == "" {
+		return ""
+	}
+	if strings.HasPrefix(rawLink, "http://") || strings.HasPrefix(rawLink, "https://") {
+		return rawLink
+	}
+	parsedURL, err := url.Parse(rawLink)
+	if err != nil {
+		return rawLink
+	}
+	decodedLink := strings.TrimSpace(parsedURL.Query().Get("url"))
+	if decodedLink == "" {
+		return rawLink
+	}
+	decodedLink, err = url.QueryUnescape(decodedLink)
+	if err != nil {
+		return rawLink
+	}
+	decodedLink = strings.TrimSpace(decodedLink)
+	if decodedLink == "" {
+		return rawLink
+	}
+	return decodedLink
+}
+
+func MarkdownHeader(level int) string {
+	headers := map[int]string{
+		1: "# ",
+		2: "## ",
+		3: "### ",
+		4: "#### ",
+		5: "##### ",
+		6: "###### ",
+	}
+	if value, ok := headers[level]; ok {
+		return value
+	}
+	return ""
 }
 
 // DrawProgressBar Draw ProgressBar

@@ -5,6 +5,8 @@ import (
 	"crypto/cipher"
 	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/yann0917/dedao-dl/services"
@@ -154,6 +156,9 @@ func generateEbookPages(enid, chapterID, token string, index, count, offset int)
 
 	for _, item := range pageList.Pages {
 		desContents := DecryptAES(item.Svg)
+		// 调试用：保存解密后的原始 XHTML（chapterID 即文件名），方便定位解析/渲染问题
+		// 按 enid 建子目录，区分不同书籍的 debug 内容
+		// saveDebug(enid, chapterID, desContents)
 		svgList = append(svgList, desContents)
 	}
 
@@ -179,6 +184,18 @@ func generateEbookPages(enid, chapterID, token string, index, count, offset int)
 	}
 
 	return
+}
+
+// saveDebug 调试用：将解密后的原始内容 保存到 output/debug/<enid> 目录
+func saveDebug(enid, chapterID string, content string) {
+	dir, err := utils.Mkdir(utils.OutputDir, "debug", enid)
+	if err != nil {
+		return
+	}
+	filePath := filepath.Join(dir, chapterID)
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		fmt.Printf("警告: 保存调试内容 失败 %s: %v\n", filePath, err)
+	}
 }
 
 // PKCS7Unpad 实现PKCS7去填充

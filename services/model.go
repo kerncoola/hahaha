@@ -37,7 +37,7 @@ type Course struct {
 	DdURL            string           `json:"dd_url"`
 	AssetsType       int              `json:"assets_type"`
 	DrmToken         string           `json:"drm_token"`
-	AudioDetail      Audio            `json:"audio_detail"`
+	AudioDetail      *Audio           `json:"audio_detail,omitempty"`
 	ProductPrice     int              `json:"product_price"`
 	Price            string           `json:"price"`
 	ProductIntro     string           `json:"product_intro"`
@@ -102,7 +102,7 @@ type OdobGroupExtInfo struct {
 	ProgressLearnedCount int      `json:"progress_learned_count"`
 	PublishTime          string   `json:"publish_time"`
 	PublishStatus        int      `json:"publish_status"`
-	AudioDetail          Audio    `json:"audio_detail"`
+	AudioDetail          *Audio   `json:"audio_detail,omitempty"`
 }
 
 // EbookExtInfo 电子书扩展信息
@@ -401,6 +401,11 @@ type ChannelHomepageCategory struct {
 	CategoryIcon     string                 `json:"category_icon"`
 	CategoryDarkIcon string                 `json:"category_dark_icon"`
 	List             []ChannelTopicCategory `json:"list"`
+}
+
+// ChannelTopicDetail 主题详情（接口返回 topic 包装结构）
+type ChannelTopicDetail struct {
+	Topic *ChannelTopicCategory `json:"topic"`
 }
 
 // ChannelTopicCategory 分类下的主题

@@ -4,17 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"html"
-	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode"
 
 	"github.com/JoshVarga/svgparser"
-	"github.com/SebastiaanKlippert/go-wkhtmltopdf"
 	"github.com/yann0917/dedao-dl/request"
 )
 
@@ -41,7 +38,21 @@ type HtmlEle struct {
 		Href  string `json:"href"`
 		Style string `json:"style"`
 	} `json:"fn"`
-	TextAlign string `json:"text_align"` // left; center; right
+	// AnchorName / AnchorChapter 记录注释引用 <a href> 的原始锚点名与所属章节，
+	// 用于在渲染前把「正文角标」与「注释正文」配对，统一成 fn-ref / fn-note 锚点。
+	AnchorName    string `json:"anchor_name"`
+	AnchorChapter string `json:"anchor_chapter"`
+	TextAlign     string `json:"text_align"` // left; center; right
+}
+
+type SvgRect struct {
+	X      float64
+	Y      float64
+	Width  float64
+	Height float64
+	Rx     string
+	Ry     string
+	Style  string
 }
 
 type EbookToc struct {
@@ -66,15 +77,8 @@ func (a SvgContents) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a SvgContents) Less(i, j int) bool { return a[i].OrderIndex < a[j].OrderIndex } // 从小到大排序
 
 const (
-	footNoteImgW     = 20 // 脚注图片≈11x11px & 特殊字图片≈19x19
-	footNoteImgH     = 20 // 行内图片高度=20
-	svgShapePath     = "path"
-	svgShapePolygon  = "polygon"
-	svgShapePolyline = "polyline"
-	svgShapeLine     = "line"
-	svgShapeRect     = "rect"
-	svgShapeEllipse  = "ellipse"
-	svgShapeCircle   = "circle"
+	footNoteImgW = 20 // 脚注图片≈11x11px & 特殊字图片≈19x19
+	footNoteImgH = 20 // 行内图片高度=20
 
 	eBookTypeHtml = "html"
 	eBookTypePdf  = "pdf"
@@ -93,7 +97,6 @@ func Svg2Html(title string, svgContents []*SvgContent, toc []EbookToc) (err erro
 	for _, ebookToc := range toc {
 		tocLevel[ebookToc.Text] = ebookToc.Level
 	}
-	// fmt.Println(tocLevel)
 
 	result, err := AllInOneHtml(svgContents, toc)
 	if err != nil {
@@ -136,8 +139,15 @@ func Svg2Pdf(title string, svgContents []*SvgContent, toc []EbookToc) (err error
 		tocLevel[ebookToc.Text] = ebookToc.Level
 	}
 
+	// 整书级注释配对：正文角标 ↔ 注释正文 双向跳转
+	chapters, bErr := buildBookChapters(svgContents)
+	if bErr != nil {
+		return bErr
+	}
+	assignFootnoteAnchors(chapters)
+
 	for k, svgContent := range svgContents {
-		chapter, coverContent, err1 := OneByOneHtml(eBookTypePdf, k, svgContent, toc)
+		chapter, coverContent, err1 := OneByOneHtml(eBookTypePdf, k, svgContent, toc, chapters[k].pages)
 		if err1 != nil {
 			err = err1
 			return
@@ -179,8 +189,16 @@ func Svg2Epub(title string, svgContents []*SvgContent, opt EpubOptions) (err err
 	}
 	// fmt.Println(chapterToc)
 
+	// 整书级注释配对：正文角标 ↔ 注释正文 双向跳转
+	chapters, bErr := buildBookChapters(svgContents)
+	if bErr != nil {
+		err = bErr
+		return
+	}
+	assignFootnoteAnchors(chapters)
+
 	for k, svgContent := range svgContents {
-		chapter, coverUrl, err1 := OneByOneHtml(eBookTypeEpub, k, svgContent, opt.Toc)
+		chapter, coverUrl, err1 := OneByOneHtml(eBookTypeEpub, k, svgContent, opt.Toc, chapters[k].pages)
 		if err1 != nil {
 			err = err1
 			return
@@ -227,95 +245,61 @@ func Svg2Epub(title string, svgContents []*SvgContent, opt EpubOptions) (err err
 	return err
 }
 
-func genPdf(buf *bytes.Buffer, fileName, coverPath string) (err error) {
-	pdfg, _ := wkhtmltopdf.NewPDFGenerator()
-
-	page := wkhtmltopdf.NewPageReader(buf)
-	page.FooterFontSize.Set(10)
-	page.FooterRight.Set("[page]")
-	page.DisableSmartShrinking.Set(true)
-
-	page.EnableLocalFileAccess.Set(true)
-	pdfg.AddPage(page)
-
-	pdfg.Cover.EnableLocalFileAccess.Set(true)
-
-	dir, _ := CurrentDir()
-	coverPath = filepath.Join(dir, coverPath)
-
-	if runtime.GOOS == "windows" {
-		pdfg.Cover.Input = coverPath
-	} else {
-		pdfg.Cover.Input = "file://" + coverPath
-	}
-
-	pdfg.Dpi.Set(300)
-
-	pdfg.TOC.Include = true
-	pdfg.TOC.TocHeaderText.Set("目 录")
-	pdfg.TOC.HeaderFontSize.Set(18)
-
-	pdfg.TOC.TocLevelIndentation.Set(15)
-	pdfg.TOC.TocTextSizeShrink.Set(0.9)
-	pdfg.TOC.DisableDottedLines.Set(false)
-	pdfg.TOC.EnableTocBackLinks.Set(true)
-
-	pdfg.PageSize.Set(wkhtmltopdf.PageSizeA4)
-
-	pdfg.MarginTop.Set(15)
-	pdfg.MarginBottom.Set(15)
-	pdfg.MarginLeft.Set(15)
-	pdfg.MarginRight.Set(15)
-
-	err = pdfg.Create()
-	if err != nil {
-		fmt.Printf("pdfg create err: %#v\n", err)
-		return
-	}
-
-	// Write buffer contents to file on disk
-	err = pdfg.WriteFile(fileName)
-	if err != nil {
-		fmt.Printf("\033[31;1m%s\033[0m\n", "失败"+err.Error())
-		return
-	}
-	fmt.Printf("\033[32;1m%s\033[0m\n", "完成")
-	err = os.Remove(coverPath)
-	return
-}
-
-func SaveFile(title, ext, content string) (err error) {
-	path, err := Mkdir(OutputDir, "Ebook")
-	if err != nil {
-		return err
-	}
-
-	fileName, err := FilePath(filepath.Join(path, FileName(title, "")), ext, false)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】 ", fileName)
-	if err = WriteFileWithTrunc(fileName, content); err != nil {
-		fmt.Printf("\033[31;1m%s\033[0m\n", "失败"+err.Error())
-		return
-	}
-	fmt.Printf("\033[32;1m%s\033[0m\n", "完成")
-	return
-}
+// footnoteExpandScript 电子书脚注点击展开脚本：
+// 点击脚注小图标，在图标旁显示注释浮层，浮层内容可选中复制。
+const footnoteExpandScript = `<script>
+(function () {
+  if (window.__fnPopupBound) return;
+  window.__fnPopupBound = true;
+  var popup = document.createElement('div');
+  popup.className = 'fn-popup';
+  popup.style.display = 'none';
+  document.body.appendChild(popup);
+  function close() { popup.style.display = 'none'; }
+  document.addEventListener('click', function (e) {
+    var trigger = e.target.closest ? e.target.closest('.fn-trigger') : null;
+    if (trigger) {
+      e.preventDefault();
+      if (popup.style.display === 'block') { close(); return; }
+      popup.textContent = trigger.getAttribute('data-footnote') || '';
+      popup.style.display = 'block';
+      var rect = trigger.getBoundingClientRect();
+      var pw = popup.offsetWidth, ph = popup.offsetHeight;
+      var left = rect.left + rect.width / 2 - pw / 2;
+      var top = rect.bottom + 6;
+      if (left < 8) left = 8;
+      if (left + pw > window.innerWidth - 8) left = window.innerWidth - pw - 8;
+      if (top + ph > window.innerHeight - 8) top = window.innerHeight - ph - 8;
+      if (top < 8) top = rect.top - ph - 6;
+      popup.style.left = left + 'px';
+      popup.style.top = top + 'px';
+      return;
+    }
+    if (popup.contains(e.target)) return;
+    close();
+  });
+})();
+</script>`
 
 // AllInOneHtml generate ebook content all in one html file
 func AllInOneHtml(svgContents []*SvgContent, toc []EbookToc) (result string, err error) {
 	result = GenHeadHtml()
 	fnA, fnB = ParseBookFnDelimiter(svgContents)
+	// 整书级注释配对：正文角标 ↔ 注释正文 双向跳转
+	chapters, bErr := buildBookChapters(svgContents)
+	if bErr != nil {
+		return "", bErr
+	}
+	assignFootnoteAnchors(chapters)
 	for k, svgContent := range svgContents {
-		chapter, _, err1 := OneByOneHtml(eBookTypeHtml, k, svgContent, toc)
+		chapter, _, err1 := OneByOneHtml(eBookTypeHtml, k, svgContent, toc, chapters[k].pages)
 		if err1 != nil {
 			err = err1
 			return
 		}
 		result += chapter
 	}
-	result += `
+	result += footnoteExpandScript + `
 </body>
 </html>`
 	// 使用同样的方法处理反转义，保留已转义的HTML标签
@@ -323,9 +307,58 @@ func AllInOneHtml(svgContents []*SvgContent, toc []EbookToc) (result string, err
 	return
 }
 
+// locateTocAnchorID 在当前渲染行上定位 TOC 锚点
+// offset 主信号：用 TOC 的 Offset（字节偏移）匹配本行 SVG text 的最小 offset，
+// 定位到章节内标题所在行（含二级/三级目录）；匹配成功推进 offsetIdx。
+// 文本兜底：对未提供有效 Offset 的目录项，按标题文本匹配定位。
+// 返回锚点 id（TOC Href 中 # 后部分），无匹配返回空串。
+func locateTocAnchorID(items []HtmlEle, offsetEntries []EbookToc, offsetIdx *int, textEntries []EbookToc, textMatched []bool, lineText string) string {
+	// 计算本行最小的字节偏移（SVG text 的 offset 属性）
+	lineMinOffset := -1
+	for _, item := range items {
+		if item.Offset == "" {
+			continue
+		}
+		if o, err := strconv.Atoi(item.Offset); err == nil {
+			if lineMinOffset == -1 || o < lineMinOffset {
+				lineMinOffset = o
+			}
+		}
+	}
+
+	// offset 主信号：按字节偏移定位下一个未消费的目录项
+	if *offsetIdx < len(offsetEntries) && lineMinOffset >= 0 {
+		entry := offsetEntries[*offsetIdx]
+		if lineMinOffset >= entry.Offset {
+			*offsetIdx++
+			if tagArr := strings.Split(entry.Href, "#"); len(tagArr) > 1 {
+				return tagArr[1]
+			}
+		}
+	}
+
+	// 文本兜底：仅对未提供有效 offset 的目录项，按标题文本匹配
+	if len([]rune(lineText)) >= 2 {
+		for i, e := range textEntries {
+			if textMatched[i] {
+				continue
+			}
+			norm := strings.ReplaceAll(e.Text, " ", "")
+			if norm != "" && strings.Contains(norm, lineText) {
+				textMatched[i] = true
+				if tagArr := strings.Split(e.Href, "#"); len(tagArr) > 1 {
+					return tagArr[1]
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
 // OneByOneHtml one by one generate chapter html
 // eType: html/pdf/epub, index: []*SvgContent index, svgContent: one chapter content
-func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookToc) (result, cover string, err error) {
+func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookToc, prepared []chapterPage) (result, cover string, err error) {
 	switch eType {
 	case eBookTypeHtml:
 		// 锚点目录
@@ -340,31 +373,59 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 		result += GenHeadHtml()
 	}
 
-	for _, content := range svgContent.Contents {
-		result += `
-<div id="` + svgContent.ChapterID + `">`
-		// 预处理 SVG 内容，处理 HTML 标签
-		processedContent := preprocessSvgContent(content)
+	// 按章节分组 TOC 项，用于在章节内定位锚点（含二级/三级目录）
+	// 有有效 Offset 的目录项走字节偏移匹配（主信号），无 Offset 的走标题文本匹配（兜底）
+	offsetEntries := make([]EbookToc, 0)
+	textEntries := make([]EbookToc, 0)
+	for _, t := range toc {
+		tagArr := strings.Split(t.Href, "#")
+		if len(tagArr) > 0 && tagArr[0] == svgContent.ChapterID {
+			if t.Offset > 0 {
+				offsetEntries = append(offsetEntries, t)
+			} else {
+				textEntries = append(textEntries, t)
+			}
+		}
+	}
+	sort.Slice(offsetEntries, func(i, j int) bool { return offsetEntries[i].Offset < offsetEntries[j].Offset })
+	offsetIdx := 0
+	textMatched := make([]bool, len(textEntries))
 
-		valid := NewValidUTF8Reader(strings.NewReader(processedContent))
-		validReader := []byte(processedContent)
-		_, _ = valid.Read(validReader)
-
-		element, err1 := svgparser.Parse(bytes.NewReader(validReader), false)
+	// 视图渲染：优先使用调用方传入（已整书解析并配对）的 pages，
+	// 否则回退到单章解析（此时不做跨章节配对，仅供 PDF 等兜底）。
+	var pages []chapterPage
+	if prepared != nil {
+		pages = prepared
+	} else {
+		var err1 error
+		pages, err1 = parseChapterPages(svgContent)
 		if err1 != nil {
 			err = err1
 			return
 		}
+	}
 
-		lineContent := GenLineContentByElement(svgContent.ChapterID, element)
+	for _, pg := range pages {
+		result += `
+<div id="` + svgContent.ChapterID + `">`
+		lineContent := pg.lineContent
+		rects := pg.rects
+		keys := pg.keys
 
-		keys := make([]float64, 0, len(lineContent))
-		for k := range lineContent {
-			keys = append(keys, k)
-		}
-		sort.Float64s(keys)
-
+		activeRectIdx := -1
 		for _, v := range keys {
+			rectIdx := matchRectForLine(rects, v)
+			if rectIdx != activeRectIdx {
+				if activeRectIdx >= 0 {
+					result += `
+</div>`
+				}
+				if rectIdx >= 0 {
+					result += `
+<div style="` + buildRectWrapperStyle(rects[rectIdx]) + `">`
+				}
+				activeRectIdx = rectIdx
+			}
 			cont, id, contWOTag, firstX := "", "", "", 0.0
 			if lineContent[v][0].ID != "" {
 				id = lineContent[v][0].ID
@@ -379,14 +440,9 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 
 				if i == 0 {
 					firstX, _ = strconv.ParseFloat(item.X, 64)
-					lastIndex := len(lineContent[v]) - 1
-					if lineContent[v][lastIndex].Name != "image" {
-						lineStyle = lineContent[v][lastIndex].Style
-					} else if lastIndex-1 >= 0 {
-						lineStyle = lineContent[v][lastIndex-1].Style
-					} else {
-						lineStyle = item.Style
-					}
+					// lineStyle 代表本行“正文”的样式：从行尾向前查找非注释引用、非图片
+					// 的文本元素，避免注释角标（Fn.Href 非空）的蓝色小字号样式污染整行正文。
+					lineStyle = findLineStyle(lineContent[v])
 				}
 				centerL := (reqEbookPageWidth / 2) * 0.9
 				centerH := (reqEbookPageWidth / 2) * 1.1
@@ -420,13 +476,24 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 							img = `<div style="` + style + `">` + img + `</div>`
 						}
 						if (w < footNoteImgW || h < footNoteImgH) && len(item.Class) > 0 {
-							img = `
+							if eType == eBookTypeHtml {
+								// HTML：点击展开浮层，注释文本存入 data-footnote，由脚本读取展示，可选中复制
+								img = `
+	<sup class="fn-trigger" data-footnote="` + item.Alt + `"><img width="` + strconv.FormatFloat(w, 'f', 0, 64) +
+									`" src="` + item.Href +
+									`" alt="` + item.Alt +
+									`" class="` + item.Class +
+									`"/></sup>`
+							} else {
+								// PDF：保留原生 title 悬浮提示
+								img = `
 	<sup><img width="` + strconv.FormatFloat(w, 'f', 0, 64) +
-								`" src="` + item.Href +
-								`" alt="` + item.Alt +
-								`" title="` + item.Alt +
-								`" class="` + item.Class +
-								`"/></sup>`
+									`" src="` + item.Href +
+									`" alt="` + item.Alt +
+									`" title="` + item.Alt +
+									`" class="` + item.Class +
+									`"/></sup>`
+							}
 						}
 					case eBookTypeEpub:
 						img = `
@@ -518,7 +585,12 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 					}
 
 					if item.Fn.Href != "" {
-						cont += fmt.Sprintf(`<a id=%s href=%s`, item.ID, item.Fn.Href)
+						if item.ID != "" {
+							cont += fmt.Sprintf(`<a id="%s" href="%s"`, item.ID, item.Fn.Href)
+						} else {
+							// 同一注释项拆分出的非首段只挂 href，不重复 id
+							cont += fmt.Sprintf(`<a href="%s"`, item.Fn.Href)
+						}
 						if item.Fn.Style != "" {
 							cont += fmt.Sprintf(` style="%s"`, item.Fn.Style)
 						}
@@ -552,13 +624,27 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 						}
 					}
 					if contWOTag != "" {
+						// 定位本行对应的 TOC 锚点（offset 主信号 + 文本兜底）
+						anchorID := locateTocAnchorID(lineContent[v], offsetEntries, &offsetIdx, textEntries, textMatched, contWOTag)
+						// 行内已有同名 id（SVG 自带锚点）时避免生成重复 id
+						if anchorID != "" && id == anchorID {
+							anchorID = ""
+						}
 						if matchH {
 							result += `
 </div>`
-							result += `<div class='header` + strconv.Itoa(level) + `'>` + GenTocLevelHtml(level, true)
+							result += `<div class='header` + strconv.Itoa(level) + `'`
+							if anchorID != "" {
+								result += ` id="` + anchorID + `"`
+							}
+							result += `>` + GenTocLevelHtml(level, true)
 						} else {
 							result += `
-	<p>`
+	<p`
+							if anchorID != "" {
+								result += ` id="` + anchorID + `"`
+							}
+							result += `>`
 						}
 					}
 					if i > 1 && item.Name == "image" {
@@ -566,15 +652,22 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 					}
 					if cont != "" {
 						// 保留每个元素的原始样式
-						if id != "" && style != "" {
-							result += `<span id="` + id + `" style="` + style + `">`
+						// 外层包裹整行：若行末是注释角标，用本行“正文”样式 lineStyle，
+						// 避免角标的小蓝样式污染整行正文（正文变蓝/变小）；
+						// 行末为正常正文/图片时保留 style（含 display:block/居中）。
+						wrapStyle := style
+						if item.Fn.Href != "" && lineStyle != "" {
+							wrapStyle = lineStyle
+						}
+						if id != "" && wrapStyle != "" {
+							result += `<span id="` + id + `" style="` + wrapStyle + `">`
 						} else {
 							if id != "" {
 								result += `<span id="` + id + `">`
 							}
-							if style != "" {
+							if wrapStyle != "" {
 								// 确保样式正确应用
-								result += `<span style="` + style + `">`
+								result += `<span style="` + wrapStyle + `">`
 							}
 						}
 						result += cont + `</span>`
@@ -589,6 +682,10 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 					}
 				}
 			}
+		}
+		if activeRectIdx >= 0 {
+			result += `
+</div>`
 		}
 		result += `</div>`
 		switch eType {
@@ -687,8 +784,12 @@ func GenHeadHtml() (result string) {
 		@font-face { font-family: "DeDaoJinKai"; src:local("DeDaoJinKai"), url("https://imgcdn.umiwi.com/ttf/dedaojinkaiw03.ttf");}
 		@font-face { font-family: "Source Code Pro"; src:local("Source Code Pro"), url("https://imgcdn.umiwi.com/ttf/0315911806889993935644188722660020367983.ttf"); }
 		table, tr, td, th, tbody, thead, tfoot {page-break-inside: avoid !important;}
+		p { margin: 1.5em 0; }
 		img { page-break-inside: avoid; max-width: 100% !important;}
 		img.epub-footnote { margin-right:5px;display: inline;font-size: 12px;}
+		/* 脚注点击展开浮层：内容可选中复制 */
+		.fn-trigger { cursor: pointer; }
+		.fn-popup { position: fixed; z-index: 9999; background: #fff; border: 1px solid #eee; box-shadow: 0 2px 12px rgba(0,0,0,.18); padding: 10px 14px; border-radius: 6px; max-width: 320px; font-size: 14px; line-height: 1.7; color: #333; user-select: text; white-space: normal; word-break: break-word; }
 	</style>
 </head>
 <body>`
@@ -763,18 +864,17 @@ func GenLineContentByElement(chapterID string, element *svgparser.Element) (line
 									hrefArr := strings.Split(href, "/")
 									href = hrefArr[len(hrefArr)-1:][0]
 									tagArr := strings.Split(href, "#")
-									// footnote jump back and forth
 									if len(tagArr) > 1 {
-										if strings.Contains(tagArr[1], fnA) {
-											ele.Fn.Href = "#" + tagArr[0] + "_" + strings.Replace(tagArr[1], fnA, fnB, -1)
-										} else {
-											ele.Fn.Href = "#" + tagArr[0] + "_" + strings.Replace(tagArr[1], fnB, fnA, -1)
-										}
-										attr["id"] = chapterID + "_" + tagArr[1]
+										// 记录注释引用的原始锚点信息，渲染前由 assignFootnoteAnchors
+										// 把「正文角标」与「注释正文」配对，统一生成 fn-ref / fn-note 锚点。
+										ele.AnchorChapter = tagArr[0]
+										ele.AnchorName = tagArr[1]
+										// 兜底：未配对前先构造成同章节锚点，保证链接可展示、可点击。
+										ele.Fn.Href = "#" + tagArr[0] + "_" + tagArr[1]
 									} else {
 										ele.Fn.Href = "#" + tagArr[0]
-										attr["id"] = chapterID
 									}
+									// 不再用 chapterID 前缀覆盖原生 id，保留 SVG 原始 id（注释正文首段自带的）。
 									ele.Fn.Style = attrC["style"]
 								}
 							}
@@ -814,6 +914,16 @@ func GenLineContentByElement(chapterID string, element *svgparser.Element) (line
 					// 检查Y坐标是否不同，通常上标的Y坐标会比基线的Y坐标小
 					yInt, _ := strconv.ParseFloat(attr["y"], 64)
 					lastYInt, _ := strconv.ParseFloat(lastY, 64)
+					// 上下标必须紧贴前一个文本元素；跨行的数字开头正文不能按上下标处理。
+					if isPossibleSuperOrSub && yInt != 0 && lastYInt != 0 && lastHInt > 0 {
+						yDiff := yInt - lastYInt
+						if yDiff < 0 {
+							yDiff = -yDiff
+						}
+						if yDiff > lastHInt*0.5 {
+							isPossibleSuperOrSub = false
+						}
+					}
 					if yInt != 0 && lastYInt != 0 && yInt < lastYInt &&
 						(lastYInt-yInt > 2) { // 至少需要有明显的Y轴差异
 						// Y坐标比前一个元素小，很可能是上标
@@ -884,20 +994,35 @@ func GenLineContentByElement(chapterID string, element *svgparser.Element) (line
 			ele.Width = attr["width"]
 			ele.Height = attr["height"]
 
-			// footnote image with text in one line
+			// 小图标通常跟正文同行，但如果前一个元素已经显式换行，
+			// 则应当跟随下一行文本，而不是挂到上一行末尾。
 			yInt, _ := strconv.ParseFloat(ele.Y, 64)
 			w, _ := strconv.ParseFloat(ele.Width, 64)
 			if children.Name == "image" && w < footNoteImgW {
-				attrPre := element.Children[k-1].Attributes
-				yInt, _ = strconv.ParseFloat(attrPre["y"], 64)
-				ele.Y = attrPre["y"]
-			}
-			// id &offset 设置标题 margin-left
-			if _, ok := attr["id"]; ok {
-				ele.ID = attr["id"]
-				if _, ok := attr["offset"]; ok {
-					offset = attr["offset"]
+				aligned := false
+				if k > 0 {
+					attrPre := element.Children[k-1].Attributes
+					prevHasExplicitNewline := attrPre["newline"] == "true"
+					if !prevHasExplicitNewline {
+						if prevY, ok := attrPre["y"]; ok {
+							yInt, _ = strconv.ParseFloat(prevY, 64)
+							ele.Y = prevY
+							aligned = true
+						}
+					}
 				}
+				if !aligned && k+1 < len(element.Children) {
+					attrNext := element.Children[k+1].Attributes
+					if nextY, ok := attrNext["y"]; ok {
+						yInt, _ = strconv.ParseFloat(nextY, 64)
+						ele.Y = nextY
+					}
+				}
+			}
+			// 捕获 id 和 offset，用于后续 TOC 锚点定位
+			ele.ID = attr["id"]
+			if _, ok := attr["offset"]; ok {
+				offset = attr["offset"]
 			}
 			ele.Offset = offset
 			ele.Href = parseAttrHref(attr)
@@ -911,7 +1036,236 @@ func GenLineContentByElement(chapterID string, element *svgparser.Element) (line
 			lastName = children.Name
 		}
 	}
+	for y := range lineContent {
+		sort.SliceStable(lineContent[y], func(i, j int) bool {
+			xi, errI := strconv.ParseFloat(lineContent[y][i].X, 64)
+			xj, errJ := strconv.ParseFloat(lineContent[y][j].X, 64)
+			if errI != nil || errJ != nil {
+				return lineContent[y][i].X < lineContent[y][j].X
+			}
+			return xi < xj
+		})
+	}
 	return
+}
+
+// findLineStyle 从行尾向前查找本行“正文”样式：
+// 跳过注释角标（AnchorName 非空）与图片，避免角标蓝色小字号污染整行正文；
+// 若整行都是角标/图片，则回退到行末元素样式。
+func findLineStyle(line []HtmlEle) string {
+	for i := len(line) - 1; i >= 0; i-- {
+		if line[i].AnchorName == "" && line[i].Name != "image" {
+			return line[i].Style
+		}
+	}
+	if len(line) > 0 {
+		return line[len(line)-1].Style
+	}
+	return ""
+}
+
+// chapterPage 是一章内单页的解析产物；bookChapter 是一章的全部页。
+type chapterPage struct {
+	chapterID   string
+	lineContent map[float64][]HtmlEle
+	rects       []SvgRect
+	keys        []float64
+}
+
+type bookChapter struct {
+	chID  string
+	pages []chapterPage
+}
+
+// parseChapterPages 解析一章的全部页面，返回每页的 lineContent/rects/keys，
+// 供整书注释配对与渲染使用（正文角标与章尾注释可能落在不同页/不同章节）。
+func parseChapterPages(svgContent *SvgContent) ([]chapterPage, error) {
+	pages := make([]chapterPage, 0, len(svgContent.Contents))
+	for _, content := range svgContent.Contents {
+		processedContent := preprocessSvgContent(content)
+		valid := NewValidUTF8Reader(strings.NewReader(processedContent))
+		validReader := []byte(processedContent)
+		_, _ = valid.Read(validReader)
+		element, err1 := svgparser.Parse(bytes.NewReader(validReader), false)
+		if err1 != nil {
+			return nil, err1
+		}
+		lineContent := GenLineContentByElement(svgContent.ChapterID, element)
+		rects := GenRectContentByElement(element)
+		keys := make([]float64, 0, len(lineContent))
+		for k := range lineContent {
+			keys = append(keys, k)
+		}
+		sort.Float64s(keys)
+		pages = append(pages, chapterPage{
+			chapterID:   svgContent.ChapterID,
+			lineContent: lineContent,
+			rects:       rects,
+			keys:        keys,
+		})
+	}
+	return pages, nil
+}
+
+// buildBookChapters 解析整本书的所有章节，返回每章的全部页（含各页 lineContent），
+// 供 assignFootnoteAnchors 进行整书级注释配对，再逐章交由 OneByOneHtml 渲染。
+func buildBookChapters(svgContents []*SvgContent) ([]bookChapter, error) {
+	chapters := make([]bookChapter, 0, len(svgContents))
+	for _, sc := range svgContents {
+		pages, err := parseChapterPages(sc)
+		if err != nil {
+			return nil, err
+		}
+		chapters = append(chapters, bookChapter{chID: sc.ChapterID, pages: pages})
+	}
+	return chapters, nil
+}
+
+// assignFootnoteAnchors 在渲染前把【整本书】的注释引用配对，统一生成互跳锚点。
+// 判定规则（与文字形式无关，只看结构）：
+//   - 带 <a href="#anchor"> 的 text 说明它引用了一段注释（正文角标 / 注释正文段）。
+//   - 原始 id 非空的段视为「注释正文」首段（注释正文首段自带 id，如 id="ch1"）；
+//     无原始 id 的段视为「正文角标」或注释正文的后续段（[、1、] 拆分的非首段）。
+//   - 当「正文角标组的 AnchorName == 注释正文组首段的原始 id」时，二者构成一对，
+//     分配 fn-ref-<角标所在章节>_<序号>（正文角标）与 fn-note-<注释所在章节>_<序号>（注释正文），
+//     两条锚点互相指向，从而实现正文角标 ↔ 注释正文 的双向跳转。
+//
+// 非配对段保持原始 href；同一注释项拆分出的多段只有首段挂 id，避免重复 id。
+func assignFootnoteAnchors(chapters []bookChapter) {
+	type fnAnchorPos struct {
+		chapter int
+		page    int
+		lineKey float64
+		index   int
+	}
+	type fnGroup struct {
+		pos   []fnAnchorPos
+		rawID string // 该组首个带原始 id 的段（注释正文首段）
+	}
+	groups := make(map[string]*fnGroup)
+	var order []string
+	for ci, ch := range chapters {
+		for pi, pg := range ch.pages {
+			for k, line := range pg.lineContent {
+				for i, ele := range line {
+					if ele.AnchorName == "" {
+						continue
+					}
+					g, ok := groups[ele.AnchorName]
+					if !ok {
+						g = &fnGroup{}
+						groups[ele.AnchorName] = g
+						order = append(order, ele.AnchorName)
+					}
+					g.pos = append(g.pos, fnAnchorPos{chapter: ci, page: pi, lineKey: k, index: i})
+					if g.rawID == "" && ele.ID != "" {
+						g.rawID = ele.ID
+					}
+				}
+			}
+		}
+	}
+	if len(groups) == 0 {
+		return
+	}
+
+	// 以「注释正文首段的原始 id」作桥，建立 rawID -> 注释正文组 的索引
+	idToGroup := make(map[string]string)
+	for key, g := range groups {
+		if g.rawID != "" {
+			idToGroup[g.rawID] = key
+		}
+	}
+
+	// g 为要写入的组；ownID 为该组自己的锚点 id；targetHref 为该组 href 指向的锚点 id
+	write := func(g *fnGroup, ownID, targetHref string) {
+		for i, p := range g.pos {
+			if i == 0 {
+				chapters[p.chapter].pages[p.page].lineContent[p.lineKey][p.index].ID = ownID
+			}
+			chapters[p.chapter].pages[p.page].lineContent[p.lineKey][p.index].Fn.Href = "#" + targetHref
+		}
+	}
+
+	seq := 0
+	for _, key := range order {
+		g := groups[key]
+		target := groups[idToGroup[key]]
+		if target == nil || target == g {
+			// 未配对（或自引用），交给兜底
+			continue
+		}
+		seq++
+		// 角标组锚点前缀用其所在章节；注释正文组用其所在章节（两者可能不同章节）。
+		refID := fmt.Sprintf("fn-ref-%s_%d", chapters[g.pos[0].chapter].chID, seq)
+		noteID := fmt.Sprintf("fn-note-%s_%d", chapters[target.pos[0].chapter].chID, seq)
+		write(g, refID, noteID)      // 正文角标组：id=refID，href=#noteID
+		write(target, noteID, refID) // 注释正文组：id=noteID，href=#refID
+	}
+
+	// 兜底：未配对且无原始 id 的段，补一个唯一 id，避免渲染出空的 id 属性
+	for _, key := range order {
+		g := groups[key]
+		if len(g.pos) == 0 {
+			continue
+		}
+		first := g.pos[0]
+		if chapters[first.chapter].pages[first.page].lineContent[first.lineKey][first.index].ID == "" {
+			chapters[first.chapter].pages[first.page].lineContent[first.lineKey][first.index].ID = "fn-orphan-" + chapters[first.chapter].chID + "_" + key
+		}
+	}
+}
+
+func GenRectContentByElement(element *svgparser.Element) (rects []SvgRect) {
+	for _, child := range element.Children {
+		if child.Name != "rect" {
+			continue
+		}
+		attr := child.Attributes
+		x, errX := strconv.ParseFloat(attr["x"], 64)
+		y, errY := strconv.ParseFloat(attr["y"], 64)
+		w, errW := strconv.ParseFloat(attr["width"], 64)
+		h, errH := strconv.ParseFloat(attr["height"], 64)
+		if errX != nil || errY != nil || errW != nil || errH != nil {
+			continue
+		}
+		rects = append(rects, SvgRect{
+			X:      x,
+			Y:      y,
+			Width:  w,
+			Height: h,
+			Rx:     attr["rx"],
+			Ry:     attr["ry"],
+			Style:  strings.ReplaceAll(attr["style"], "fill", "background"),
+		})
+	}
+	sort.SliceStable(rects, func(i, j int) bool {
+		return rects[i].Y < rects[j].Y
+	})
+	return
+}
+
+func matchRectForLine(rects []SvgRect, lineY float64) int {
+	for i, rect := range rects {
+		if lineY >= rect.Y && lineY <= rect.Y+rect.Height {
+			return i
+		}
+	}
+	return -1
+}
+
+func buildRectWrapperStyle(rect SvgRect) string {
+	styles := []string{
+		rect.Style,
+		"padding: 0.2em 1.2em;",
+		"margin: 1em 0;",
+	}
+	if rect.Rx != "" {
+		styles = append(styles, "border-radius:"+rect.Rx+"px;")
+	} else if rect.Ry != "" {
+		styles = append(styles, "border-radius:"+rect.Ry+"px;")
+	}
+	return strings.Join(styles, "")
 }
 
 func parseAttrHref(attr map[string]string) string {
